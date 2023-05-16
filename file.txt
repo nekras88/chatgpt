@@ -1,0 +1,395 @@
+//
+// Source code recreated from a .class file by IntelliJ IDEA
+// (powered by FernFlower decompiler)
+//
+
+package ru.sbercity.sdk.common.service.impl;
+
+import java.lang.reflect.Field;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+import javax.persistence.Column;
+import javax.persistence.EntityManager;
+import javax.persistence.JoinColumn;
+import javax.persistence.PersistenceContext;
+import javax.persistence.Query;
+import javax.persistence.Table;
+import org.apache.commons.lang3.tuple.Pair;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageImpl;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.domain.Sort;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.util.CollectionUtils;
+import ru.sbercity.sdk.common.entity.IdEntity;
+import ru.sbercity.sdk.common.model.FilterDto;
+import ru.sbercity.sdk.common.service.iface.FilterService;
+import ru.sbercity.sdk.common.utils.NullGuard;
+
+@Service
+public class FilterServiceImpl implements FilterService {
+    @PersistenceContext
+    EntityManager entityManager;
+    private static final String IS_NULL = "is null";
+    private static final String CLIENT = "client";
+    private static final String RESPONSIBLE = "responsible";
+    private static final String EXECUTOR = "executor";
+    private static final String SPLIT_PATTERN = "\\s*,\\s*";
+
+    @Transactional(
+        readOnly = true
+    )
+    public <T extends IdEntity> Page<T> searchByFilter(List<FilterDto> filters, Class<?> entity, boolean showArchive, Pageable pageable) {
+        String tableName = ((Table)entity.getAnnotation(Table.class)).name();
+        StringBuilder queryBuilder = new StringBuilder();
+        queryBuilder.append("SELECT * FROM ").append(tableName).append(" e ");
+        Sort sort = pageable.getSort();
+        Optional<Sort.Order> sortOrder = sort.get().findFirst();
+        Set<String> fields = (Set)Optional.ofNullable(filters).stream().flatMap(Collection::stream).map(FilterDto::field).collect(Collectors.toSet());
+        sortOrder.ifPresent((o) -> {
+            fields.add(o.getProperty());
+        });
+        Map<String, Pair<String, String>> allJoinColumnNames = this.getAllJoinColumnNames(entity, fields);
+        Map<String, String> forNull = new HashMap();
+        Set<Integer> numberJointColumn = new HashSet();
+        if (CollectionUtils.isEmpty(filters)) {
+            this.showIsDeleted(showArchive, queryBuilder, true);
+            sortOrder.ifPresent((o) -> {
+                this.prepareJoinForSorting(o.getProperty(), queryBuilder, allJoinColumnNames);
+            });
+            this.prepareSorting(queryBuilder, sortOrder, allJoinColumnNames);
+            Query query = this.entityManager.createNativeQuery(queryBuilder.toString(), entity);
+            return new PageImpl(query.getResultList(), pageable, (long)query.getResultList().size());
+        } else {
+            this.prepareJoin(filters, queryBuilder, allJoinColumnNames, forNull, numberJointColumn);
+            sortOrder.ifPresent((o) -> {
+                this.prepareJoinForSorting(o.getProperty(), queryBuilder, allJoinColumnNames);
+            });
+            boolean isFirstElem = true;
+
+            for(int i = 0; i < filters.size(); ++i) {
+                String logicalOperator = ((FilterDto)filters.get(i)).logicalOperator();
+                String field = ((FilterDto)filters.get(i)).field();
+                String operator = ((FilterDto)filters.get(i)).operator();
+                String value = ((FilterDto)filters.get(i)).value();
+                Map<String, String> auditFieldMap = this.getAuditFieldMap();
+                this.checkForFirstElement(isFirstElem, queryBuilder);
+                if (!isFirstElem) {
+                    queryBuilder.append(" ").append(logicalOperator).append(" ");
+                }
+
+                if (this.checkForNull(operator) && forNull.containsKey(field)) {
+                    queryBuilder.append("e.").append((String)forNull.get(field));
+                } else if (!numberJointColumn.isEmpty() && numberJointColumn.contains(i) && !this.checkForNull(operator.toLowerCase())) {
+                    if (isClient(field)) {
+                        this.appendForOperator(queryBuilder, field, i);
+                    } else if (isEmployee(field)) {
+                        queryBuilder.append(" lower(").append("t").append(i).append(".employee_json->>'name')");
+                    } else {
+                        queryBuilder.append("lower(").append("t").append(i).append(".name ").append(")");
+                    }
+                } else {
+                    String preparedField;
+                    if (auditFieldMap.containsKey(field)) {
+                        preparedField = (String)auditFieldMap.get(field);
+                        queryBuilder.append("e.").append(preparedField);
+                    } else if (this.isStringField(field, entity)) {
+                        queryBuilder.append("lower(").append("e.").append(field).append(")");
+                    } else {
+                        queryBuilder.append("e.");
+                        if (!field.toLowerCase().contains("client") && !isEmployee(field)) {
+                            queryBuilder.append(field).append(" ");
+                        } else {
+                            preparedField = isClient(field) ? this.getFieldForClient() : this.getFieldForEmployee(field);
+                            queryBuilder.append(preparedField).append(" ");
+                        }
+                    }
+                }
+
+                this.appendLogicalOperation(queryBuilder, operator, value.toLowerCase());
+                isFirstElem = false;
+            }
+
+            this.showIsDeleted(showArchive, queryBuilder, false);
+            this.prepareSorting(queryBuilder, sortOrder, allJoinColumnNames);
+            Query query = this.entityManager.createNativeQuery(queryBuilder.toString(), entity);
+            query.setFirstResult((int)pageable.getOffset());
+            query.setMaxResults(pageable.getPageSize());
+            return new PageImpl(query.getResultList(), pageable, (long)query.getResultList().size());
+        }
+    }
+
+    private void prepareSorting(StringBuilder queryBuilder, Optional<Sort.Order> sortOrder, Map<String, Pair<String, String>> allJoinColumnNames) {
+        if (sortOrder.isPresent()) {
+            Sort.Order order = (Sort.Order)sortOrder.get();
+            String property = order.getProperty();
+            queryBuilder.append(" order by ");
+            if (allJoinColumnNames.containsKey(order.getProperty()) && Objects.nonNull(((Pair)allJoinColumnNames.get(order.getProperty())).getValue())) {
+                queryBuilder.append(property).append(".name").append(" ").append(order.getDirection());
+            } else if (isClient(property)) {
+                queryBuilder.append(property).append(".client_json").append(this.getStringForClient(order.getProperty().toLowerCase())).append(" ").append(order.getDirection());
+            } else if (isEmployee(property)) {
+                queryBuilder.append(property).append(".employee_json").append("->>'name'").append(" ").append(order.getDirection());
+            } else {
+                this.addSorting(order, queryBuilder);
+            }
+        }
+
+    }
+
+    private void addSorting(Sort.Order order, StringBuilder queryBuilder) {
+        String property = order.getProperty();
+        if (this.getAuditFieldMap().containsKey(property)) {
+            property = (String)this.getAuditFieldMap().get(property);
+        }
+
+        queryBuilder.append("e.").append(property).append(" ").append(order.getDirection());
+    }
+
+    private void showIsDeleted(boolean isDelete, StringBuilder queryBuilder, boolean isEmptyRequest) {
+        if (!isDelete) {
+            if (isEmptyRequest) {
+                queryBuilder.append(" where ");
+            } else {
+                queryBuilder.append(" AND ");
+            }
+
+            queryBuilder.append("(e.is_delete = false or e.is_delete is null)");
+        }
+
+    }
+
+    void checkForFirstElement(boolean isFirstElem, StringBuilder queryBuilder) {
+        if (isFirstElem) {
+            queryBuilder.append(" WHERE ");
+        }
+
+    }
+
+    private void prepareJoin(List<FilterDto> filters, StringBuilder queryBuilder, Map<String, Pair<String, String>> allJoinColumnNames, Map<String, String> forNull, Set<Integer> numberJointColumn) {
+        for(int i = 0; i < filters.size(); ++i) {
+            String field = ((FilterDto)filters.get(i)).field();
+            String operator = ((FilterDto)filters.get(i)).operator();
+            Pair<String, String> pair = (Pair)allJoinColumnNames.get(field);
+            if (!this.checkForNull(operator)) {
+                if (Objects.nonNull(pair) && Objects.nonNull(pair.getValue())) {
+                    queryBuilder.append(" join ").append((String)pair.getValue()).append(" t").append(i).append(" on e.").append((String)pair.getKey()).append(" = t").append(i).append(".id ");
+                    numberJointColumn.add(i);
+                } else if (isClient(field)) {
+                    queryBuilder.append(" join ").append("client").append(" t").append(i).append(" on e.").append(this.getFieldForClient()).append(" = t").append(i).append(".id ");
+                    numberJointColumn.add(i);
+                } else if (isEmployee(field)) {
+                    queryBuilder.append(" join ").append("employee").append(" t").append(i).append(" on e.");
+                    String columnInTask = this.getFieldForEmployee(field);
+                    queryBuilder.append(columnInTask);
+                    queryBuilder.append(" = t").append(i).append(".id ");
+                    numberJointColumn.add(i);
+                }
+            } else if (Objects.nonNull(pair)) {
+                forNull.put(field, (String)pair.getKey());
+            }
+        }
+
+    }
+
+    private static boolean isClient(String field) {
+        return field.toLowerCase().contains("client");
+    }
+
+    private static boolean isEmployee(String field) {
+        return field.toLowerCase().contains("responsible") || field.toLowerCase().contains("executor");
+    }
+
+    private void prepareJoinForSorting(String field, StringBuilder queryBuilder, Map<String, Pair<String, String>> allJoinColumnNames) {
+        Pair<String, String> pair = (Pair)allJoinColumnNames.get(field);
+        if (Objects.nonNull(pair) && Objects.nonNull(pair.getValue())) {
+            queryBuilder.append(" join ").append((String)pair.getValue()).append(" ").append(field).append(" on e.").append((String)pair.getKey()).append(" = ").append(field).append(".id ");
+        } else if (isClient(field)) {
+            queryBuilder.append(" join ").append("client").append(" ").append(field).append(" on e.").append(this.getFieldForClient()).append(" = ").append(field).append(".id ");
+        } else if (isEmployee(field)) {
+            queryBuilder.append(" join ").append("employee").append(" ").append(field).append(" on e.");
+            String columnInTask = this.getFieldForEmployee(field);
+            queryBuilder.append(columnInTask);
+            queryBuilder.append(" = ").append(field).append(".id ");
+        }
+
+    }
+
+    private String getFieldForEmployee(String field) {
+        String columnInTask;
+        if (field.toLowerCase().contains("responsible")) {
+            columnInTask = "responsible_id";
+        } else if (field.equals("executorIdName")) {
+            columnInTask = "executor_id";
+        } else {
+            columnInTask = "co_executor_id";
+        }
+
+        return columnInTask;
+    }
+
+    private String getFieldForClient() {
+        return "client_id";
+    }
+
+    private boolean checkForNull(String operator) {
+        return operator.equals("is null") || operator.equals("is not null");
+    }
+
+    private void appendForOperator(StringBuilder queryBuilder, String field, int number) {
+        queryBuilder.append(" lower(").append("t").append(number).append(".client_json");
+        queryBuilder.append(this.getStringForClient(field)).append(")");
+    }
+
+    private String getStringForClient(String field) {
+        String var10000;
+        switch (field) {
+            case "client":
+                var10000 = "->>'name'";
+                break;
+            case "clientemail":
+                var10000 = "->'emailClient'->>'email'";
+                break;
+            case "clientphone":
+                var10000 = "->'phoneClient'->>'phone'";
+                break;
+            default:
+                throw new IllegalArgumentException(String.format("Client field: %s is invalid", field));
+        }
+
+        return var10000;
+    }
+
+    private void appendLogicalOperation(StringBuilder queryBuilder, String operator, String value) {
+        switch (operator) {
+            case "like":
+                queryBuilder.append(" LIKE '%").append(value.toLowerCase()).append("%'");
+                break;
+            case "not like":
+                queryBuilder.append(" NOT LIKE '%").append(value.toLowerCase()).append("%'");
+                break;
+            case "starts with":
+                queryBuilder.append(" LIKE '").append(value).append("%'");
+                break;
+            case "ends with":
+                queryBuilder.append(" LIKE '%").append(value).append("'");
+                break;
+            case "is null":
+                queryBuilder.append(" ").append("is null");
+                break;
+            case "is not null":
+                queryBuilder.append(" IS NOT NULL");
+                break;
+            case "eq":
+                queryBuilder.append(" = '").append(value).append("'");
+                break;
+            case "not eq":
+                queryBuilder.append(" != '").append(value).append("'");
+                break;
+            case "greater":
+                queryBuilder.append(" > '").append(value).append("'");
+                break;
+            case "less":
+                queryBuilder.append(" < '").append(value).append("'");
+                break;
+            case "in":
+                String[] values = value.split("\\s*,\\s*");
+                queryBuilder.append(" IN (");
+
+                for(int j = 0; j < values.length; ++j) {
+                    queryBuilder.append("'").append(values[j]).append("'");
+                    if (j < values.length - 1) {
+                        queryBuilder.append(",");
+                    }
+                }
+
+                queryBuilder.append(")");
+                break;
+            default:
+                throw new IllegalArgumentException(String.format("Unknown logical operator: %s", operator));
+        }
+
+    }
+
+    public Map<String, Pair<String, String>> getAllJoinColumnNames(Class<?> clazz, Set<String> fieldsDtos) {
+        Map<String, Pair<String, String>> fieldWithColumnNameMap = new HashMap();
+        Map<String, Field> allField = (Map)Arrays.stream(clazz.getDeclaredFields()).collect(Collectors.toMap(Field::getName, Function.identity()));
+        List<Field> fields = new ArrayList();
+        fieldsDtos.forEach((f) -> {
+            if (allField.containsKey(f)) {
+                fields.add((Field)allField.get(f));
+            }
+
+        });
+        Iterator var6 = fields.iterator();
+
+        while(var6.hasNext()) {
+            Field field = (Field)var6.next();
+            JoinColumn joinColumn = (JoinColumn)field.getDeclaredAnnotation(JoinColumn.class);
+            Column column = (Column)field.getDeclaredAnnotation(Column.class);
+            Table table = (Table)field.getType().getDeclaredAnnotation(Table.class);
+            String tableColumnName;
+            if (!Objects.nonNull(column) && !Objects.nonNull(joinColumn)) {
+                tableColumnName = field.getName();
+            } else {
+                tableColumnName = Objects.isNull(joinColumn) ? column.name() : joinColumn.name();
+            }
+
+            Pair<String, String> pair = Pair.of(tableColumnName, (String)NullGuard.nullGuard(() -> {
+                return table.name();
+            }));
+            fieldWithColumnNameMap.put(field.getName(), pair);
+        }
+
+        return fieldWithColumnNameMap;
+    }
+
+    private Map<String, String> getAuditFieldMap() {
+        Map<String, String> map = new HashMap();
+        map.put("createdBy", "created_by");
+        map.put("createdDate", "created_date");
+        map.put("deletedBy", "deleted_by");
+        map.put("deletedDate", "deleted_date");
+        map.put("isDelete", "is_delete");
+        map.put("lastModifiedBy", "last_modified_by");
+        map.put("lastModifiedDate", "last_modified_date");
+        return map;
+    }
+
+    private boolean isStringField(String fieldName, Class<?> entity) {
+        Class<?> fieldType = this.getType(fieldName, entity);
+        return Objects.isNull(fieldType) ? false : String.class.isAssignableFrom(fieldType);
+    }
+
+    private Class<?> getType(String fieldName, Class<?> entity) {
+        Map<String, Field> stringFieldMap = this.allFieldsForClass(entity);
+        Field field = (Field)stringFieldMap.get(fieldName);
+        return Objects.isNull(field) ? null : field.getType();
+    }
+
+    private Map<String, Field> allFieldsForClass(Class<?> c) {
+        Class<?> current = c;
+
+        ArrayList fields;
+        for(fields = new ArrayList(); !current.equals(Object.class); current = current.getSuperclass()) {
+            fields.addAll(Arrays.asList(current.getDeclaredFields()));
+        }
+
+        return (Map)fields.stream().collect(Collectors.toMap(Field::getName, Function.identity()));
+    }
+
+    public FilterServiceImpl() {
+    }
+}
